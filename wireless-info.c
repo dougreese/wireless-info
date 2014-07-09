@@ -37,6 +37,8 @@
 #include <sys/socket.h>
 #include <net/ethernet.h>
 #include <linux/wireless.h>
+#include <libnetlink.h>
+#include <time.h>
 
 /* Some usefull constants */
 #define KILO	1e3
@@ -441,6 +443,132 @@ int wireless_range(const char *ifname)
 }
 
 /*
+ * Prints all wireless info
+ */
+void wireless_info(const char* ifname)
+{
+  wireless_essid(ifname);
+  wireless_ap(ifname);
+  wireless_bitrate(ifname);
+  wireless_txpower(ifname);
+  printf("--------\n");
+
+  wireless_stats(ifname);
+  printf("--------\n");
+
+  wireless_range(ifname);
+}
+
+/*
+ * Interface states
+ */ 
+static const char *oper_states[] = {
+	"UNKNOWN", "NOTPRESENT", "DOWN", "LOWERLAYERDOWN",
+	"TESTING", "DORMANT",	 "UP"
+};
+
+/*
+ * Prints state description for a state flag
+ */
+static void print_operstate(FILE *f, __u8 state)
+{
+	if (state >= sizeof(oper_states)/sizeof(oper_states[0]))
+		fprintf(f, "state %#x ", state);
+	else
+		fprintf(f, "state %s ", oper_states[state]);
+}
+
+/*
+ * Prints timestamp
+ */
+int print_timestamp(FILE *fp)
+{
+  struct timeval tv;
+  char *tstr;
+
+  memset(&tv, 0, sizeof(tv));
+  gettimeofday(&tv, NULL);
+
+  tstr = asctime(localtime(&tv.tv_sec));
+  tstr[strlen(tstr)-1] = 0;
+  fprintf(fp, "%s %ld usec", tstr, (long)tv.tv_usec);
+  return 0;
+}
+
+/*
+ * Prints some basic info from a LINK message
+ */
+int print_linkinfo(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
+{
+	FILE *fp = arg;
+	int len = n->nlmsg_len;
+	struct ifinfomsg *ifi = NLMSG_DATA(n);
+	struct rtattr * tb[IFLA_MAX+1];
+  char b1[IFNAMSIZ];
+  
+  print_timestamp(fp);
+  printf(" - ");
+ 
+  len -= NLMSG_LENGTH(sizeof(*ifi)); 
+  if (len < 0) {
+    fprintf(stderr, "Message too short!\n");
+    return -1;
+  }
+
+  if (n->nlmsg_type == RTM_DELLINK)
+	fprintf(fp, "Deleted ");
+
+  parse_rtattr(tb, IFLA_MAX, IFLA_RTA(ifi), len);
+
+	fprintf(fp, "%s ", 
+		tb[IFLA_IFNAME] ? rta_getattr_str(tb[IFLA_IFNAME]) : "<nil>");
+
+	if (tb[IFLA_OPERSTATE]) {
+    print_operstate(fp, rta_getattr_u8(tb[IFLA_OPERSTATE]));
+    printf("\n");
+  
+    if (rta_getattr_u8(tb[IFLA_OPERSTATE]) == IF_OPER_UP) {
+      wireless_info(rta_getattr_str(tb[IFLA_IFNAME]));
+    }
+  } else {
+    printf("\n");
+  }
+}
+
+/*
+ * Accepts netlink messages
+ */
+int accept_msg(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
+{
+  FILE *fp = arg;
+
+	switch(n->nlmsg_type) {
+		case RTM_NEWLINK:
+		case RTM_DELLINK:
+			//printf("Link state changed\n");
+      print_linkinfo(who, n, arg);
+			break;
+		case RTM_GETLINK:
+		case RTM_SETLINK:
+		case RTM_NEWADDR:
+		case RTM_DELADDR:
+		case RTM_GETADDR:
+		case RTM_NEWROUTE:
+		case RTM_DELROUTE:
+		case RTM_GETROUTE:
+		case RTM_NEWRULE:
+		case RTM_DELRULE:
+		case RTM_GETRULE:
+    case RTM_NEWNEIGH:
+    case RTM_DELNEIGH:
+    case RTM_GETNEIGH:
+		default:
+			printf("other message: %d %p\n", n->nlmsg_type, arg);
+			break;
+	}
+}
+
+/*
  * Main application
  */ 
 int main(int argc, char const *argv[]) 
@@ -462,17 +590,7 @@ int main(int argc, char const *argv[])
  
     if (check_wireless(ifa->ifa_name, protocol)) {
       printf("Interface %s is wireless: %s\n", ifa->ifa_name, protocol);
-
-      wireless_essid(ifa->ifa_name);
-      wireless_ap(ifa->ifa_name);
-      wireless_bitrate(ifa->ifa_name);
-      wireless_txpower(ifa->ifa_name);
-      printf("--------\n");
-
-      wireless_stats(ifa->ifa_name);
-      printf("--------\n");
-
-      wireless_range(ifa->ifa_name);
+      wireless_info(ifa->ifa_name);
     } else {
       printf("interface %s is not wireless\n", ifa->ifa_name);
     }
@@ -481,6 +599,27 @@ int main(int argc, char const *argv[])
   }
  
   freeifaddrs(ifaddr);
+
+  /* optionally monitor for events
+     use "monitor" as only parameter */
+  if (argc == 2 && strcmp(argv[1], "monitor") == 0) {
+    printf("Listening for wireless events...\n");
+
+    struct rtnl_handle rth;
+    unsigned int groups = RTNLGRP_LINK;
+   
+    if (rtnl_open(&rth, groups) < 0)
+    {
+      printf("rtnl_open() failed in %s %s\n",__FUNCTION__,__FILE__);
+      return -1;
+    }
+    if (rtnl_listen(&rth, accept_msg, stdout) > 0)
+    {
+      printf("failed in rtnl_listen()\n");
+      return -1;
+    }
+  }
+    
   return 0;
 }
 
